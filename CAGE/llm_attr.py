@@ -856,10 +856,6 @@ class LLMGradientAttribtion(LLMAttribution):
             # set target as next known generated token
             target_token = self.generation_ids[0, step].item()
    
-            # # Make a tensor to store the gradients over all IG steps 
-            # # each individual gradient will be [batch_size, seq_len, embedding_dim]
-            # IG_grads = torch.zeros((steps, input_embeds_orig.shape[1], input_embeds_orig.shape[2])).to(self.device)
-
             # Make a tensor to store the sum of the gradients across the IG steps 
             IG_sum = torch.zeros(input_embeds_orig.shape[1], input_embeds_orig.shape[2], device=self.device)
 
@@ -899,10 +895,6 @@ class LLMGradientAttribtion(LLMAttribution):
                 losses.sum().backward()
 
                 # perform (x - x') * grad * step_size 
-                # baseline_diff = (input_embeds_orig - baseline_embeds) 
-                # IG_grads[batch_start : batch_end] = baseline_diff * input_embeds_batch.grad.detach().clone() * step_sizes_batch # [batch_size, seq_len, embedding_dim]
-
-                # perform (x - x') * grad * step_size 
                 baseline_diff = (input_embeds_orig - baseline_embeds) 
                 grads_batch = baseline_diff * input_embeds_batch.grad.detach().clone() * step_sizes_batch# [batch_size, seq_len, embedding_dim]
                 # Sum over batch
@@ -912,22 +904,11 @@ class LLMGradientAttribtion(LLMAttribution):
                 del input_embeds_batch, logits, probs, grads_batch
                 torch.cuda.empty_cache()
 
-                # del input_embeds_batch, logits, probs, losses
-
-            # # This is a sum over the number of IG steps. Finishes IG result    
-            # IG_grads = IG_grads.sum(0) # From [steps, seq_len, embed_dim] to [seq_len, embed_dim]
-            # # take the sum over the embedding_dim
-            # IG_grads = IG_grads.sum(-1) # [seq_len]
-
             # Sum across embedding dimension
             IG_grads = IG_sum.sum(-1).detach().cpu() 
 
             # pad these grads with nan since they must fit into score_array with all other token attributions
             score_array[step] = self.pad_vector(IG_grads.view(1, -1), total_length, torch.nan) # [1, total_length]
-
-            # clean up before the next loop
-            # del input_embeds_batch, logits, probs, losses
-            # torch.cuda.empty_cache()
 
             # Append next token to input for next step generation and attribution
             input_ids_all = torch.cat([input_ids_all, torch.tensor([[target_token]]).to(self.device)], dim=1)
@@ -948,17 +929,8 @@ class LLMPerturbationAttribution(LLMAttribution):
         self.mlm_tokenizer = LongformerTokenizer.from_pretrained("allenai/longformer-base-4096")
         self.mlm_model = LongformerForMaskedLM.from_pretrained("allenai/longformer-base-4096").to(self.device)
 
-
-
     #  we want to evaluate the probability of producing a reponse given a prompt
     def compute_logprob_response_given_prompt(self, prompt_ids, response_ids) -> torch.Tensor:
-        """
-        Compute log-probabilities of `response_ids` given `prompt_ids`.
-
-        prompt_ids: [B, N]
-        response_ids: [B, M]
-        Returns: [B, M]
-        """
         # concat prompt and response
         input_ids = torch.cat([prompt_ids, response_ids], dim=1)   # [B, N+M]
         attention_mask = torch.ones_like(input_ids)
@@ -982,18 +954,6 @@ class LLMPerturbationAttribution(LLMAttribution):
 
 
     def compute_kl_response_given_prompt(self, prompt_ids, response_ids) -> torch.Tensor:
-        """
-        Compute KL divergence scores for each token in `response_ids` given `prompt_ids`.
-        Mimics run_probing(metrics="kl_div") but only for the full sequence.
-
-        Args:
-            model: HuggingFace autoregressive model.
-            prompt_ids: [B, N] tensor of prompt token IDs.
-            response_ids: [B, M] tensor of response token IDs.
-
-        Returns:
-            KL-divergence scores: [B, M] tensor.
-        """
         device = prompt_ids.device
         prompt_ids = prompt_ids.to(device)
         response_ids = response_ids.to(device)
@@ -1141,45 +1101,44 @@ class LLMPerturbationAttribution(LLMAttribution):
         Replace masked positions in a LLaMA token sequence using LED.
         """
 
-        # 1. Convert input_ids to tokens
+        # Convert input_ids to tokens
         new_text_tokens = self.tokenizer.convert_ids_to_tokens(input_ids[0])
         
-        # 2. Mask only selected tokens
+        # Mask only selected tokens
         for idx in tokens_to_mask:
             new_text_tokens[idx] = self.mlm_tokenizer.mask_token
 
-        # 3. Convert tokens back to string
+        # Convert tokens back to string
         new_text = self.tokenizer.convert_tokens_to_string(new_text_tokens)
 
-        # 4. Encode for Longformer MLM
+        # Encode for Longformer MLM
         inputs = self.mlm_tokenizer(new_text, return_tensors="pt", max_length=4096, truncation=True)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        # 5. Find masked positions
+        # Find masked positions
         masked_positions = (inputs["input_ids"] == self.mlm_tokenizer.mask_token_id).nonzero(as_tuple=True)[1]
 
-        # 6. Add global attention on masked positions
+        # Add global attention on masked positions
         global_attention_mask = torch.zeros_like(inputs["input_ids"])
         global_attention_mask[0, masked_positions] = 1
         inputs["global_attention_mask"] = global_attention_mask
 
-        # 7. Predict all masked positions in one forward pass
+        # Predict all masked positions in one forward pass
         with torch.no_grad():
             logits = self.mlm_model(**inputs).logits  # [batch, seq_len, vocab_size]
             predicted_ids = logits[0, masked_positions, :].argmax(dim=-1)
             replacement_ids = inputs["input_ids"].clone()
             replacement_ids[0, masked_positions] = predicted_ids
 
-        # 8. Convert predicted tokens to string
-        regenerated_tokens = [replacement_ids[0, idx] for idx in masked_positions]
+        # Convert predicted tokens to string
         regenerated_text = self.mlm_tokenizer.decode(predicted_ids, skip_special_tokens=True)
         if regenerated_text and regenerated_text[0] != ' ':
             regenerated_text = ' ' + regenerated_text
             
-        # 8. Re-tokenize with LLaMA tokenizer
+        # Re-tokenize with LLaMA tokenizer
         replacement_input_ids = self.tokenizer(regenerated_text, return_tensors='pt').input_ids
 
-        # 9. Pad/truncate to match original masked length
+        # Pad/truncate to match original masked length
         original_len = len(tokens_to_mask)
         new_len = replacement_input_ids.shape[1]
 
@@ -1340,8 +1299,6 @@ class LLMAttentionAttribution(LLMAttribution):
                 
                 # get attention weights (mean over layers, heads, and attention rows)
                 attentions = torch.stack(outputs.attentions, 0).mean(0).mean(1).mean(1) # [batch, seq_length]
-                attentions = torch.stack(outputs.attentions, 0)[-1].mean(1).mean(1) # [batch, seq_length]
-                # attentions = torch.stack(outputs.attentions, 0)[-1].mean(1).mean(1) # [batch, seq_length]
                 # pad the scores with nan since they must fit into score_array with all other token attributions
                 score_array[step] = self.pad_vector(attentions.detach().cpu(), total_length, torch.nan)
 
