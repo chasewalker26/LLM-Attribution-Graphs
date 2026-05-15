@@ -799,7 +799,7 @@ class LLMAttributionResult():
 
         return attr, row_attr, rec_attr
     
-class LLMGradientAttribtion(LLMAttribution):
+class LLMGradientAttribution(LLMAttribution):
     def __init__(self, model, tokenizer):
         super().__init__(model, tokenizer)
 
